@@ -18,11 +18,22 @@ led_buf = numpy.zeros((NUM_STRINGS, LEDS_PER_STRING * 3), dtype = numpy.uint8)
 sockbuf = {}
 last_update = [0] * NUM_STRINGS
 
-def main():
+def open_opc_sock():
+    global opc_sock
+    if opc_sock != None:
+        return
     opc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    opc_sock.connect((OPCSERVER_HOST, OPCSERVER_PORT))
+    try:
+        opc_sock.connect((OPCSERVER_HOST, OPCSERVER_PORT))
+    except:
+        opc_sock = None
+        return
     opc_sock.setblocking(0)
     print('Connected to OPC server')
+
+def main():
+    global tcp_listen, clients, opc_sock, led_buf, sockbuf, last_update
+    open_opc_sock()
 
     tcp_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -82,9 +93,13 @@ def main():
         if not newdata:
             continue
         sz = NUM_STRINGS * LEDS_PER_STRING * 3
-        r = opc_sock.send('\x00\x00%c%c' % (sz >> 8, sz & 0xff) + led_buf.tostring())
-        if r != sz + 4:
-            print('Short write, got %d, expected %d' % (r, sz + 4))
+        try:
+            r = opc_sock.send('\x00\x00%c%c' % (sz >> 8, sz & 0xff) + led_buf.tostring())
+            if r != sz + 4:
+                print('Short write, got %d, expected %d' % (r, sz + 4))
+        except:
+            opc_sock = None
+            open_opc_sock()
 if __name__ == '__main__':
     main()
 
