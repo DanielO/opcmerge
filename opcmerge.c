@@ -54,9 +54,8 @@ main(int argc, char **argv) {
     if (createlisten(BIND_PORT, &listensock4, &listensock6) != 0)
 	exit(EX_OSERR);
 
-    if ((opcsock = opcconnect(OPC_HOST, OPC_PORT)) == -1) {
+    if ((opcsock = opcconnect(OPC_HOST, OPC_PORT)) == -1)
 	exit(EX_OSERR);
-    }
 
     fds = NULL;
     numclients = 0;
