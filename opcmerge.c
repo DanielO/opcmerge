@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <assert.h>
 #include <err.h>
 #include <netdb.h>
@@ -11,12 +13,18 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BIND_PORT 7890
 
 #define OPC_HOST "127.0.0.1"
 #define OPC_PORT "7891"
+
+#define IDLE_TIME 5
+
+#define NUM_CHAN	4
+#define NUM_LEDS	682
 
 struct client_info_t {
     int fd;
@@ -32,13 +40,19 @@ struct clentry {
     SLIST_ENTRY(clentry)	entries;
 };
 
-#define NUM_CHAN	4
-#define NUM_LEDS	682
 uint8_t ledbuf[NUM_CHAN][NUM_LEDS * 3];
 int ledbuf_dirty = 0;
+struct {
+    time_t	lastupdate;
+    int		clear;
+#define SWAP_RGB	0
+#define SWAP_GRB	1
+    int		swap;
+} channel_state[NUM_CHAN];
 
 static int		createlisten(int listenport, int *listensock4, int *listensock6);
 static int		opcconnect(const char *host, const char *port);
+static void		clearidle(void);
 static char *		get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen);
 static struct clentry *	findsock(int fd, struct clientshead *head);
 static void		readfromsock(int fd, struct clientshead *head, int *numclients);
@@ -46,10 +60,20 @@ static void		closesock(int fd, struct clientshead *head, int *numclients);
 
 int
 main(int argc, char **argv) {
-    int listensock4, listensock6, opcsock, numfds, numlisten, numclients;
+    int listensock4, listensock6, opcsock, numfds, numlisten, numclients, rtn, i;
     struct pollfd *fds;
     struct clentry *clp;
     struct clientshead clients = SLIST_HEAD_INITIALIZER(clients);
+
+    for (i = 0; i < NUM_CHAN; i++) {
+	channel_state[i].lastupdate = 0;
+	channel_state[i].clear = 1;
+	channel_state[i].swap = SWAP_RGB;
+    }
+    /* Swap RGB to GRB for panel */
+    channel_state[2].swap = SWAP_GRB;
+
+    bzero(ledbuf, sizeof(ledbuf));
 
     if (createlisten(BIND_PORT, &listensock4, &listensock6) != 0)
 	exit(EX_OSERR);
@@ -87,7 +111,14 @@ main(int argc, char **argv) {
 	    fds[sidx++].revents = 0;
 	}
 	assert(numfds == sidx);
-	if (poll(fds, sidx, -1) == -1) {
+	rtn = poll(fds, sidx, 1000);
+
+	clearidle();
+
+	if (rtn == 0)
+	    continue;
+
+	if (rtn == -1) {
 	    if (errno == EINTR)
 		continue;
 	    warn("poll failed");
@@ -161,8 +192,7 @@ main(int argc, char **argv) {
 }
 
 static int
-createlisten(int listenport, int *listensock4, int *listensock6)
-{
+createlisten(int listenport, int *listensock4, int *listensock6) {
     struct sockaddr_in laddr4;
     struct sockaddr_in6 laddr6;
     int one = 1;
@@ -217,8 +247,7 @@ createlisten(int listenport, int *listensock4, int *listensock6)
 
 /* Stolen from http://beej.us/guide/bgnet/output/html/multipage/inet_ntopman.html */
 static char *
-get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
-{
+get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen) {
     switch(sa->sa_family) {
     case AF_INET:
 	inet_ntop(AF_INET, &(((struct sockaddr_in *)sa)->sin_addr),
@@ -239,16 +268,30 @@ get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 
 /* Search the list for the fd */
 static struct clentry *
-findsock(int fd, struct clientshead *head)
-{
-	struct clentry *clp;
+findsock(int fd, struct clientshead *head) {
+    struct clentry *clp;
 
-	SLIST_FOREACH(clp, head, entries) {
-		if (clp->fd == fd)
-			return(clp);
+    SLIST_FOREACH(clp, head, entries) {
+	if (clp->fd == fd)
+	    return(clp);
+    }
+
+    return(NULL);
+}
+
+/* Clear idle channels */
+static void
+clearidle(void) {
+    int i;
+    time_t now = time(NULL);
+
+    for (i = 0; i < NUM_CHAN; i++) {
+	if (now > channel_state[i].lastupdate + IDLE_TIME && channel_state[i].clear == 0) {
+	    bzero(ledbuf[i], sizeof(ledbuf[i]));
+	    channel_state[i].clear = 1;
+	    fprintf(stderr, "Clearing idle channel %d\n", i);
 	}
-
-	return(NULL);
+    }
 }
 
 static int
@@ -335,8 +378,27 @@ readfromsock(int fd, struct clientshead *head, int *numclients) {
 		printf("Packet size %d from client %s out of range\n", plen, clp->addrtxt);
 		goto pullup;
 	    }
-	    memcpy(&ledbuf[chan][0], &clp->buf[4], plen);
+	    switch (channel_state[chan].swap)  {
+	    case SWAP_GRB: {
+		//printf("swapping RGB -> GRB\n");
+		uint8_t *src = &clp->buf[4];
+		uint8_t *dst = &ledbuf[chan][0];
+		for (int i = 0; i < plen / 3; i++) {
+		    dst[1] = src[0];
+		    dst[0] = src[1];
+		    dst[2] = src[2];
+		    dst += 3;
+		    src += 3;
+		}
+		break;
+	    }
+	    default:
+		memcpy(&ledbuf[chan][0], &clp->buf[4], plen);
+		break;
+	    }
 	    ledbuf_dirty = 1;
+	    channel_state[chan].lastupdate = time(NULL);
+	    channel_state[chan].clear = 0;
 	} else {
 	    warnx("Unknown command 0x%02x from %s", cmd, clp->addrtxt);
 	}
